@@ -1,112 +1,173 @@
-pipeline{
-    agent any 
-    environment{
-        VERSION = "${env.BUILD_ID}"
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        spec:
+          containers:
+          - name: gradle
+            image: gradle:jdk11-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+            - sleep
+            args:
+            - 99d
+          - name: kaniko
+            image: gcr.io/kaniko-project/executor:v1.6.0-debug
+            imagePullPolicy: IfNotPresent
+            command:
+            - sleep
+            args:
+            - 99d
+            volumeMounts:
+              - name: jenkins-docker-cfg
+                mountPath: /kaniko/.docker
+          - name: grype
+            image: alpine:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - sleep
+            args:
+            - 99d          
+            env:
+              - name: DOCKER_CONFIG
+                value: /config
+            volumeMounts:
+              - name: jenkins-docker-cfg
+                mountPath: /config
+          - name: zap-dast
+            image: owasp/zap2docker-stable:2.11.0
+            imagePullPolicy: IfNotPresent
+            command:
+            - sleep
+            args:
+            - 99d
+          volumes:
+          - name: jenkins-docker-cfg
+            projected:
+              sources:
+              - secret:
+                  name: artifact-registry
+                  items:
+                    - key: .dockerconfigjson
+                      path: config.json
+        '''
     }
-    stages{
-        stage("sonar quality check"){
-            agent {
-                docker {
-                    image 'openjdk:11'
-                }
-            }
-            steps{
-                script{
-                    withSonarQubeEnv(credentialsId: 'sonar-token') {
-                            sh 'chmod +x gradlew'
-                            sh './gradlew sonarqube'
-                    }
+  }
 
-                    timeout(time: 1, unit: 'HOURS') {
-                      def qg = waitForQualityGate()
-                      if (qg.status != 'OK') {
-                           error "Pipeline aborted due to quality gate failure: ${qg.status}"
+    environment {
+      PROJETO = 'gradle-test'
+      NOME = 'walber'
+      EMAIL = 'walber.silva@sysmap.com.br'
+      NAMESPACE = 'bc-renan-medina'
+      PORTA = '8080'
+
+
+      REGISTRY = 'us-central1-docker.pkg.dev/sysmap-coe-tecnologia'
+      REGISTRY_DIR = 'coe-images/gradle'
+
+      // credenciais  
+      MVN_SET = credentials('maven_settings')
+      CRED_VAULT_SONAR = 'sonar-login'
+      CRED_GITLAB = 'gitlab-w'
+      CRED_KUBERNETES = 'sa-renan-internal'
+      
+    }
+    
+        stages {
+            
+              stage('Checkout sources') {
+                steps {
+                  checkout scm
+                }
+              }
+ 
+              stage('Gradle') {
+                steps {
+                  container('gradle') {
+                    sh './gradlew clean build'
+                  }
+                }
+              }
+        
+              stage('Unit Test') {
+                steps {
+                  container('gradle') {
+                    sh './gradlew test'
+                  }
+                }
+              }
+            
+              stage('Sast') {
+                steps {
+                  container('gradle') {
+
+                    withCredentials([[$class: 'VaultUsernamePasswordCredentialBinding', credentialsId: env.CRED_VAULT_SONAR, usernameVariable: 'SONAR_LOGIN']]) {
+                      sh './gradlew sonarqube -Dsonar.host.url=http://sonarqube-sonarqube.sonarqube.svc.cluster.local:9000 -Dsonar.login=$SONAR_LOGIN'
+
+                    }
+                  }
+                }
+              }
+
+              stage('Kaniko') {
+                steps {
+                    container('kaniko') {
+                      sh '/kaniko/executor --context `pwd` --destination $REGISTRY/$REGISTRY_DIR/$NOME/$PROJETO:$BUILD_NUMBER'
+                  }
+                }
+              }
+
+                stage('Grype Security Scan') {
+                  steps{
+                    container('grype') {
+                      sh 'apk add curl'
+                      sh 'curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin'
+                      sh 'grype $REGISTRY/$REGISTRY_DIR/$NOME/$PROJETO:$BUILD_NUMBER'
+                    }
+                  }
+                }
+
+                stage('Commit') {
+                  steps {
+                    withCredentials([gitUsernamePassword(credentialsId: env.CRED_GITLAB, gitToolName: 'Default')]) {
+                      sh """
+                      git config --global user.name $NOME
+                      git config --global user.email $EMAIL
+                      sed -i 's,$REGISTRY.*,$REGISTRY/$REGISTRY_DIR/$NOME/$PROJETO,' helm/values.yaml
+                      sed -i 's,tag:.*",tag: \"$BUILD_NUMBER\",' helm/values.yaml
+                      sed -i 's,namespace:.*,namespace: $NAMESPACE,' helm/values.yaml
+                      sed -i 's,name:.*,name: $NOME,' helm/Chart.yaml
+                      git add helm/values.yaml helm/Chart.yaml
+                      git commit -am 'Alterando a versao do projeto por $NOME'
+                      git push origin HEAD:master
+                      """
+                    }
+                  }
+              }
+              
+/*
+                stage('Deploy with helm') {
+                  steps{
+                    container('helm') {
+                        withKubeConfig([credentialsId: env.CRED_KUBERNETES,
+                                        namespace: env.NAMESPACE,
+                                ]) {
+                          sh 'helm upgrade --install $PROJETO helm/'
+                        }
                       }
-                    }
-
-                }  
-            }
-        }
-        stage("docker build & docker push"){
-            steps{
-                script{
-                    withCredentials([string(credentialsId: 'docker_pass', variable: 'docker_password')]) {
-                             sh '''
-                                docker build -t 34.125.214.226:8083/springapp:${VERSION} .
-                                docker login -u admin -p $docker_password 34.125.214.226:8083 
-                                docker push  34.125.214.226:8083/springapp:${VERSION}
-                                docker rmi 34.125.214.226:8083/springapp:${VERSION}
-                            '''
-                    }
+                  }
                 }
-            }
-        }
-        stage('indentifying misconfigs using datree in helm charts'){
-            steps{
-                script{
 
-                    dir('kubernetes/') {
-                        withEnv(['DATREE_TOKEN=GJdx2cP2TCDyUY3EhQKgTc']) {
-                              sh 'helm datree test myapp/'
-                        }
+                stage('ZAP - DAST') {
+                  steps{
+                    container('zap-dast') {
+                      sh 'zap-api-scan.py -f openapi -t http://$PROJETO-$NOME.$NAMESPACE.svc.cluster.local:$PORTA'
                     }
+                  }
                 }
-            }
+*/
         }
-        stage("pushing the helm charts to nexus"){
-            steps{
-                script{
-                    withCredentials([string(credentialsId: 'docker_pass', variable: 'docker_password')]) {
-                          dir('kubernetes/') {
-                             sh '''
-                                 helmversion=$( helm show chart myapp | grep version | cut -d: -f 2 | tr -d ' ')
-                                 tar -czvf  myapp-${helmversion}.tgz myapp/
-                                 curl -u admin:$docker_password http://34.125.214.226:8081/repository/helm-hosted/ --upload-file myapp-${helmversion}.tgz -v
-                            '''
-                          }
-                    }
-                }
-            }
-        }
-
-        stage('manual approval'){
-            steps{
-                script{
-                    timeout(10) {
-                        mail bcc: '', body: "<br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> Go to build url and approve the deployment request <br> URL de build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "${currentBuild.result} CI: Project name -> ${env.JOB_NAME}", to: "deekshith.snsep@gmail.com";  
-                        input(id: "Deploy Gate", message: "Deploy ${params.project_name}?", ok: 'Deploy')
-                    }
-                }
-            }
-        }
-
-        stage('Deploying application on k8s cluster') {
-            steps {
-               script{
-                   withCredentials([kubeconfigFile(credentialsId: 'kubernetes-config', variable: 'KUBECONFIG')]) {
-                        dir('kubernetes/') {
-                          sh 'helm upgrade --install --set image.repository="34.125.214.226:8083/springapp" --set image.tag="${VERSION}" myjavaapp myapp/ ' 
-                        }
-                    }
-               }
-            }
-        }
-
-        stage('verifying app deployment'){
-            steps{
-                script{
-                     withCredentials([kubeconfigFile(credentialsId: 'kubernetes-config', variable: 'KUBECONFIG')]) {
-                         sh 'kubectl run curl --image=curlimages/curl -i --rm --restart=Never -- curl myjavaapp-myapp:8080'
-
-                     }
-                }
-            }
-        }
-    }
-
-    post {
-		always {
-			mail bcc: '', body: "<br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL de build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "${currentBuild.result} CI: Project name -> ${env.JOB_NAME}", to: "deekshith.snsep@gmail.com";  
-		 }
-	   }
 }
+
