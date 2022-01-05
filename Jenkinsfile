@@ -80,6 +80,7 @@ pipeline {
               stage('Checkout sources') {
                 steps {
                   checkout scm
+                  sh 'chmod +x ./gradlew'
                 }
               }
  
